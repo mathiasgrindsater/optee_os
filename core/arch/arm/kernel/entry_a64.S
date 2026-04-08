@@ -506,7 +506,13 @@ clear_nex_bss:
 	ldr	x1, boot_mmu_config + CORE_MMU_CONFIG_MAP_OFFSET
 	sub	x0, x0, x1
 	bl	thread_spmc_register_secondary_ep
+	/* VMI ADDITION */
+	/* Old call 
 	b	thread_ffa_msg_wait
+	*/
+	b	thread_ffa_msg_wait_vmi
+	/* VMI ADDITION END */
+
 #else
 	/*
 	 * Pass the vector address returned from main_init Compensate for

@@ -40,6 +40,20 @@ FUNC thread_ffa_msg_wait , :
 	b	.ffa_msg_loop
 END_FUNC thread_ffa_msg_wait
 
+/* VMI ADDITION */
+FUNC thread_ffa_msg_wait_vmi , :                                                                                                                                                      
+    mov_imm x0, FFA_MSG_WAIT                                                                                                                                                        
+    mov     x1, #FFA_TARGET_INFO_MBZ                                                                                                                                                
+    mov     x2, #FFA_PARAM_MBZ                                                                                                                                                      
+    mov     x3, #FFA_PARAM_MBZ                                                                                                                                                      
+    adr_l   x4, __text_start
+    adr_l   x5, __text_end                                                                                                                                                          
+    mov     x6, #FFA_PARAM_MBZ                          
+    mov     x7, #FFA_PARAM_MBZ                                                                                                                                                      
+    b       .ffa_msg_loop
+END_FUNC thread_ffa_msg_wait_vmi
+/* VMI ADDITION END */
+
 	/* Caller provides x1, x3-x7 params */
 LOCAL_FUNC ffa_msg_send_direct_resp , :
 	msr	spsel, #1
