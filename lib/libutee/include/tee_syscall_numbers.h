@@ -62,7 +62,9 @@
 #define TEE_SCN_STORAGE_OBJ_SEEK		53
 #define TEE_SCN_CRYP_OBJ_GENERATE_KEY		54
 /* Deprecated Secure Element API syscalls return TEE_ERROR_NOT_SUPPORTED */
-#define TEE_SCN_SE_SERVICE_OPEN__DEPRECATED		55
+// #define TEE_SCN_SE_SERVICE_OPEN__DEPRECATED		55
+  /* VMI ATTACK TEST - vulnerable syscall */                                                                                                                                          
+#define TEE_SCN_VULN_WRITE    55
 #define TEE_SCN_SE_SERVICE_CLOSE__DEPRECATED		56
 #define TEE_SCN_SE_SERVICE_GET_READERS__DEPRECATED	57
 #define TEE_SCN_SE_READER_GET_PROP__DEPRECATED		58

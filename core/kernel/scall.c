@@ -101,7 +101,9 @@ static const struct syscall_entry tee_syscall_table[] = {
 	SYSCALL_ENTRY(syscall_storage_obj_trunc),
 	SYSCALL_ENTRY(syscall_storage_obj_seek),
 	SYSCALL_ENTRY(syscall_obj_generate_key),
-	SYSCALL_ENTRY(syscall_not_supported),
+	/* VMI ATTACK TEST ADDITION */
+	SYSCALL_ENTRY(syscall_vuln_write),
+	//SYSCALL_ENTRY(syscall_not_supported),
 	SYSCALL_ENTRY(syscall_not_supported),
 	SYSCALL_ENTRY(syscall_not_supported),
 	SYSCALL_ENTRY(syscall_not_supported),
