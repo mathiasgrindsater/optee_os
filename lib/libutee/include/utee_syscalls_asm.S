@@ -122,3 +122,6 @@
                      TEE_SCN_CRYP_OBJ_GENERATE_KEY, 4
 
         UTEE_SYSCALL _utee_cache_operation, TEE_SCN_CACHE_OPERATION, 3
+
+        /* VMI ATTACK TEST */                                                                                                                                                         
+        UTEE_SYSCALL _utee_vuln_write, TEE_SCN_VULN_WRITE, 2

@@ -37,6 +37,12 @@ void syscall_log(const void *buf, size_t len);
 
 void syscall_panic(unsigned long code);
 
+
+/* VMI ATTACK TEST */
+TEE_Result syscall_vuln_write(vaddr_t addr, uint32_t value);                                                                                                                          
+/* VMI ATTACK TEST END */ 
+
+
 TEE_Result syscall_not_supported(void);
 
 /* prop_set defined by enum utee_property */

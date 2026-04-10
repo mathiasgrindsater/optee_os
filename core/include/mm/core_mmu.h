@@ -707,6 +707,9 @@ void core_mmu_set_secure_memory(paddr_t base, size_t size);
  */
 void core_mmu_get_secure_memory(paddr_t *base, paddr_size_t *size);
 
+/* VMI ATTACK TEST */                                                                                                                                                                 
+void kernel_write_primitive(vaddr_t target_va, uint32_t payload);
+
 #endif /*__ASSEMBLER__*/
 
 #endif /* __MM_CORE_MMU_H */

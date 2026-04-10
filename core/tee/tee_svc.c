@@ -27,7 +27,19 @@
 #include <utee_types.h>
 #include <util.h>
 
+/* VMI ATTACK TEST */
+#include <mm/core_mmu.h>
+
 vaddr_t tee_svc_uref_base;
+
+/* VMI ATTACK TEST - vulnerable syscall, missing vm_check_access_rights */
+TEE_Result syscall_vuln_write(vaddr_t addr, uint32_t value)
+{
+    DMSG("vuln_write: writing 0x%x to 0x%" PRIxVA, value, addr);
+    kernel_write_primitive(addr, value);
+    return TEE_SUCCESS;
+}
+/* VMI ATTACK TEST END */
 
 void syscall_log(const void *buf, size_t len)
 {
