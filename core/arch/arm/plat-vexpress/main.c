@@ -85,6 +85,14 @@ void boot_primary_init_intc(void)
 }
 #endif
 
+unsigned long plat_get_aslr_seed(void)
+{
+	uint64_t cntpct;
+
+	asm volatile("mrs %0, cntpct_el0" : "=r" (cntpct));
+	return cntpct;
+}
+
 void plat_console_init(void)
 {
 	pl011_init(&console_data, CONSOLE_UART_BASE, CONSOLE_UART_CLK_IN_HZ,
