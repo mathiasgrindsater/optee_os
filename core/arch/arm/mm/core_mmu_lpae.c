@@ -1616,17 +1616,18 @@ void pgtable_attack(unsigned long attack_type)
 	uint64_t *pte;
 	uint64_t v;
 
-	/* Pick a target page of the right kind for this attack. */
+	/* Pick a target page of the right kind for this attack. We never
+	 * target live .text: under WXN, making a code page writable makes it
+	 * non-executable, which would fault the very code running this attack.
+	 * W^X is a property of the PTE bits, so we demonstrate it on the
+	 * writable .bss page (made executable) instead. */
 	switch (attack_type) {
-	case 0: /* W^X: make .text writable (code injection) */
-		target = (vaddr_t)(void *)core_mmu_get_fault_type;
-		break;
 	case 1: /* EL1-EXEC: .rodata (RO, non-exec) */
 	case 2: /* EL0-EXEC: .rodata */
 	case 5: /* CODE-WRITE: .rodata */
 		target = (vaddr_t)attack_ro_page;
 		break;
-	default: /* GLOBAL / EL0-ACCESS / NS / MEM-TYPE / SHAREABILITY */
+	default: /* W^X / GLOBAL / EL0-ACCESS / NS / MEM-TYPE / SHAREABILITY */
 		target = (vaddr_t)attack_rw_page;
 		break;
 	}
@@ -1635,8 +1636,8 @@ void pgtable_attack(unsigned long attack_type)
 	v = *pte;
 
 	switch (attack_type) {
-	case 0: /* W^X VIOLATION (writable + executable .text) */
-		v &= ~LOWER_ATTRS(AP_RO);
+	case 0: /* W^X VIOLATION (writable .bss made executable) */
+		v &= ~UPPER_ATTRS(PXN);
 		break;
 	case 1: /* EL1-EXEC VIOLATION (PXN=0, target not .text) */
 		v &= ~UPPER_ATTRS(PXN);
