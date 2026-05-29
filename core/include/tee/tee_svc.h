@@ -37,6 +37,9 @@ void syscall_log(const void *buf, size_t len);
 
 void syscall_panic(unsigned long code);
 
+/* VMI PAGE-TABLE ATTACK TEST */
+TEE_Result syscall_pgtable_attack(unsigned long attack_type);
+
 TEE_Result syscall_not_supported(void);
 
 /* prop_set defined by enum utee_property */

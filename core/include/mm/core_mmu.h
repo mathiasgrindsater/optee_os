@@ -707,6 +707,9 @@ void core_mmu_set_secure_memory(paddr_t base, size_t size);
  */
 void core_mmu_get_secure_memory(paddr_t *base, paddr_size_t *size);
 
+/* VMI PAGE-TABLE ATTACK TEST */
+void pgtable_attack(unsigned long attack_type);
+
 #endif /*__ASSEMBLER__*/
 
 #endif /* __MM_CORE_MMU_H */

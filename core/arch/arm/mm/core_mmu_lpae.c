@@ -1579,4 +1579,108 @@ enum core_mmu_fault core_mmu_get_fault_type(uint32_t fault_descr)
 		return CORE_MMU_FAULT_OTHER;
 	}
 }
+
+/* ── VMI PAGE-TABLE ATTACK TEST ──────────────────────────────────
+ * Malicious page-table edits used to validate the S-EL2 page-table
+ * defense. Each attack crafts one leaf PTE that violates a specific
+ * defense policy and writes it into a defense-tracked L3 table. On a
+ * defended build the store traps and the SPMC panics; on baseline it
+ * silently applies. Targets are dedicated pages (a writable .bss page,
+ * a read-only .rodata page) plus a .text function, so the attacks have
+ * no collateral effect on a baseline run.
+ */
+#define ATTACK_PA_MASK 0x0000FFFFFFFFF000ULL
+
+static uint8_t attack_rw_page[PAGE_SIZE] __aligned(PAGE_SIZE);
+static const uint8_t attack_ro_page[PAGE_SIZE] __aligned(PAGE_SIZE) = { 1 };
+
+static uint64_t *attack_find_l3_entry(vaddr_t va)
+{
+	uint64_t ttbr0 = read_ttbr0_el1();
+	uint64_t *l1 = phys_to_virt(ttbr0 & ATTACK_PA_MASK,
+				    MEM_AREA_TEE_RAM, sizeof(uint64_t));
+	uint64_t l1_idx = (va >> 30) & 0x1FF;
+	uint64_t *l2 = phys_to_virt(l1[l1_idx] & ATTACK_PA_MASK,
+				    MEM_AREA_TEE_RAM, sizeof(uint64_t));
+	uint64_t l2_idx = (va >> 21) & 0x1FF;
+	uint64_t *l3 = phys_to_virt(l2[l2_idx] & ATTACK_PA_MASK,
+				    MEM_AREA_TEE_RAM, sizeof(uint64_t));
+	uint64_t l3_idx = (va >> 12) & 0x1FF;
+
+	return &l3[l3_idx];
+}
+
+void pgtable_attack(unsigned long attack_type)
+{
+	vaddr_t target;
+	uint64_t *pte;
+	uint64_t v;
+
+	/* Pick a target page of the right kind for this attack. */
+	switch (attack_type) {
+	case 0: /* W^X: make .text writable (code injection) */
+		target = (vaddr_t)(void *)core_mmu_get_fault_type;
+		break;
+	case 1: /* EL1-EXEC: .rodata (RO, non-exec) */
+	case 2: /* EL0-EXEC: .rodata */
+	case 5: /* CODE-WRITE: .rodata */
+		target = (vaddr_t)attack_ro_page;
+		break;
+	default: /* GLOBAL / EL0-ACCESS / NS / MEM-TYPE / SHAREABILITY */
+		target = (vaddr_t)attack_rw_page;
+		break;
+	}
+
+	pte = attack_find_l3_entry(target);
+	v = *pte;
+
+	switch (attack_type) {
+	case 0: /* W^X VIOLATION (writable + executable .text) */
+		v &= ~LOWER_ATTRS(AP_RO);
+		break;
+	case 1: /* EL1-EXEC VIOLATION (PXN=0, target not .text) */
+		v &= ~UPPER_ATTRS(PXN);
+		break;
+	case 2: /* EL0-EXEC VIOLATION (UXN=0, target not pool/kcode) */
+		v &= ~UPPER_ATTRS(XN);
+		break;
+	case 3: /* GLOBAL-MAPPING VIOLATION (EL0-accessible + global) */
+		v |= LOWER_ATTRS(AP_UNPRIV);
+		v &= ~LOWER_ATTRS(NON_GLOBAL);
+		break;
+	case 4: /* EL0-ACCESS VIOLATION (EL0-accessible kernel page, nG=1) */
+		v |= LOWER_ATTRS(AP_UNPRIV);
+		v |= LOWER_ATTRS(NON_GLOBAL);
+		break;
+	case 5: /* CODE-WRITE VIOLATION (writable .rodata, non-exec) */
+		v &= ~LOWER_ATTRS(AP_RO);
+		break;
+	case 6: /* NS VIOLATION (secure page mapped NS=1) */
+		v |= LOWER_ATTRS(NS);
+		break;
+	case 7: /* MEM-TYPE VIOLATION (secure page, Device attr) */
+		v &= ~LOWER_ATTRS(ATTR_INDEX_MASK);
+		v |= LOWER_ATTRS(ATTR_DEVICE_nGnRnE_INDEX);
+		break;
+	case 8: /* SHAREABILITY VIOLATION (secure page, SH != ISH) */
+		v &= ~LOWER_ATTRS(ISH);
+		break;
+	default:
+		EMSG("pgtable_attack: unknown attack_type %lu", attack_type);
+		return;
+	}
+
+	DMSG("pgtable_attack %lu: VA 0x%" PRIxVA " PTE 0x%" PRIx64
+	     " -> 0x%" PRIx64, attack_type, target, *pte, v);
+
+	dsb();
+	*pte = v;		/* the attack: store into a tracked L3 */
+	dsb();
+	tlbi_all();
+	isb();
+
+	DMSG("pgtable_attack %lu: PTE now 0x%" PRIx64, attack_type, *pte);
+}
+/* ── VMI PAGE-TABLE ATTACK TEST END ──────────────────────────── */
+
 #endif /*ARM64*/

@@ -15,6 +15,7 @@
 #include <kernel/user_access.h>
 #include <memtag.h>
 #include <mm/core_memprot.h>
+#include <mm/core_mmu.h>
 #include <mm/mobj.h>
 #include <mm/tee_mm.h>
 #include <mm/vm.h>
@@ -28,6 +29,15 @@
 #include <util.h>
 
 vaddr_t tee_svc_uref_base;
+
+/* VMI PAGE-TABLE ATTACK TEST */
+TEE_Result syscall_pgtable_attack(unsigned long attack_type)
+{
+	DMSG("ATTACK: page-table attack type %lu", attack_type);
+	pgtable_attack(attack_type);
+	return TEE_SUCCESS;
+}
+/* VMI PAGE-TABLE ATTACK TEST END */
 
 void syscall_log(const void *buf, size_t len)
 {
