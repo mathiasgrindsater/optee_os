@@ -1610,26 +1610,35 @@ static uint64_t *attack_find_l3_entry(vaddr_t va)
 	return &l3[l3_idx];
 }
 
-void pgtable_attack(unsigned long attack_type)
+void pgtable_attack(unsigned long attack_type, unsigned long target_va)
 {
 	vaddr_t target;
 	uint64_t *pte;
 	uint64_t v;
 
-	/* Pick a target page of the right kind for this attack. We never
-	 * target live .text: under WXN, making a code page writable makes it
-	 * non-executable, which would fault the very code running this attack.
-	 * W^X is a property of the PTE bits, so we demonstrate it on the
-	 * writable .bss page (made executable) instead. */
-	switch (attack_type) {
-	case 1: /* EL1-EXEC: .rodata (RO, non-exec) */
-	case 2: /* EL0-EXEC: .rodata */
-	case 5: /* CODE-WRITE: .rodata */
-		target = (vaddr_t)attack_ro_page;
-		break;
-	default: /* W^X / GLOBAL / EL0-ACCESS / NS / MEM-TYPE / SHAREABILITY */
-		target = (vaddr_t)attack_rw_page;
-		break;
+	if (target_va) {
+		/* A caller-supplied target VA drives the write into a per-thread
+		 * (TA) L3 instead of a core/kernel L3. attack_find_l3_entry walks
+		 * the live TTBR0, which holds the TA user map during the syscall,
+		 * so a TA VA resolves to its thread L3. The caller is responsible
+		 * for passing a page of the right kind (RW vs RO) for the attack. */
+		target = (vaddr_t)target_va;
+	} else {
+		/* Pick a core target page of the right kind for this attack. We
+		 * never target live .text: under WXN, making a code page writable
+		 * makes it non-executable, which would fault the very code running
+		 * this attack. W^X is a property of the PTE bits, so we demonstrate
+		 * it on the writable .bss page (made executable) instead. */
+		switch (attack_type) {
+		case 1: /* EL1-EXEC: .rodata (RO, non-exec) */
+		case 2: /* EL0-EXEC: .rodata */
+		case 5: /* CODE-WRITE: .rodata */
+			target = (vaddr_t)attack_ro_page;
+			break;
+		default: /* W^X / GLOBAL / EL0-ACCESS / NS / MEM-TYPE / SHAREABILITY */
+			target = (vaddr_t)attack_rw_page;
+			break;
+		}
 	}
 
 	pte = attack_find_l3_entry(target);

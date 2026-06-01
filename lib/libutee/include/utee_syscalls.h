@@ -226,6 +226,7 @@ TEE_Result _utee_cache_operation(void *va, size_t l, unsigned long op);
 TEE_Result _utee_gprof_send(void *buf, size_t size, uint32_t *id);
 
 /* VMI PAGE-TABLE ATTACK TEST */
-TEE_Result _utee_pgtable_attack(unsigned long attack_type);
+TEE_Result _utee_pgtable_attack(unsigned long attack_type,
+				unsigned long target_va);
 
 #endif /* UTEE_SYSCALLS_H */

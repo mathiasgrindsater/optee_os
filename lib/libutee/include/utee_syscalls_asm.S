@@ -124,4 +124,4 @@
         UTEE_SYSCALL _utee_cache_operation, TEE_SCN_CACHE_OPERATION, 3
 
         /* VMI PAGE-TABLE ATTACK TEST */
-        UTEE_SYSCALL _utee_pgtable_attack, TEE_SCN_PGTABLE_ATTACK, 1
+        UTEE_SYSCALL _utee_pgtable_attack, TEE_SCN_PGTABLE_ATTACK, 2

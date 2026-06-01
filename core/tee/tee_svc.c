@@ -31,10 +31,12 @@
 vaddr_t tee_svc_uref_base;
 
 /* VMI PAGE-TABLE ATTACK TEST */
-TEE_Result syscall_pgtable_attack(unsigned long attack_type)
+TEE_Result syscall_pgtable_attack(unsigned long attack_type,
+				  unsigned long target_va)
 {
-	DMSG("ATTACK: page-table attack type %lu", attack_type);
-	pgtable_attack(attack_type);
+	DMSG("ATTACK: page-table attack type %lu target_va 0x%lx",
+	     attack_type, target_va);
+	pgtable_attack(attack_type, target_va);
 	return TEE_SUCCESS;
 }
 /* VMI PAGE-TABLE ATTACK TEST END */
