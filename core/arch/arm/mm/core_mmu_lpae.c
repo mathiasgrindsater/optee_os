@@ -1594,6 +1594,12 @@ enum core_mmu_fault core_mmu_get_fault_type(uint32_t fault_descr)
 static uint8_t attack_rw_page[PAGE_SIZE] __aligned(PAGE_SIZE);
 static const uint8_t attack_ro_page[PAGE_SIZE] __aligned(PAGE_SIZE) = { 1 };
 
+/* Fresh attacker-controlled L3-shaped buffer for attack 25a: a TA-loadable
+ * L3 page that the attacker pre-populates with a malicious PTE then links
+ * into the per-thread L2. The defense's link-time pre-validation walk in
+ * vmi_check_thread_l2_entry should panic before the link completes. */
+static uint64_t attack_fake_l3[512] __aligned(PAGE_SIZE);
+
 static uint64_t *attack_find_l3_entry(vaddr_t va)
 {
 	uint64_t ttbr0 = read_ttbr0_el1();
@@ -1610,11 +1616,223 @@ static uint64_t *attack_find_l3_entry(vaddr_t va)
 	return &l3[l3_idx];
 }
 
+/* Walk TTBR0_EL1 → return the live L1 base (kernel L1 during the syscall).
+ * The L1 page holds both kernel L1 (slots 0..3 with T0SZ=32) and TA L1
+ * (slots 4..7), contiguous in 4 KB. */
+static uint64_t *attack_get_l1(void)
+{
+	uint64_t ttbr0 = read_ttbr0_el1();
+
+	return phys_to_virt(ttbr0 & ATTACK_PA_MASK,
+			    MEM_AREA_TEE_RAM, sizeof(uint64_t));
+}
+
+/* Walk TTBR0 → L1 → return the L2 base reachable from the L1 entry that
+ * covers `va`. For a kernel VA this is the kernel L2; for a TA user VA
+ * this is the per-thread L2. */
+static uint64_t *attack_get_l2(vaddr_t va)
+{
+	uint64_t *l1 = attack_get_l1();
+	uint64_t l1_idx = (va >> 30) & 0x1FF;
+
+	return phys_to_virt(l1[l1_idx] & ATTACK_PA_MASK,
+			    MEM_AREA_TEE_RAM, sizeof(uint64_t));
+}
+
+/* First L2 slot whose descriptor is 0 (unmapped). -1 if none. */
+static int32_t attack_find_empty_l2_slot(uint64_t *l2)
+{
+	for (int32_t i = 0; i < 512; i++)
+		if (l2[i] == 0)
+			return i;
+	return -1;
+}
+
+/* Dispatcher for structural attacks (types 20+): writes targeting L1
+ * entries, L2 entries, and link-time L3 validation. target_va: any kernel
+ * VA is unused for L1 attacks; any TA user VA is required for L2/link
+ * attacks so we can resolve the per-thread L2 via the live walk. */
+static void pgtable_attack_structure(unsigned long attack_type,
+				     unsigned long target_va)
+{
+	uint64_t *l1 = attack_get_l1();
+	uint64_t *l2;
+	int32_t slot;
+	uint64_t pa;
+
+	switch (attack_type) {
+	case 20: { /* Kernel L1 entry write — unlink a kernel L1 slot.
+		    * Write 0 (a value the TA-slot policy *would* allow), so
+		    * the defense's value check passes and the kernel-snapshot
+		    * check fires distinctly: "kernel entry[i] write 0x0". */
+		for (uint32_t i = 0; i < 4; i++) {
+			if ((l1[i] & 0x3) == TABLE_DESC) {
+				DMSG("attack 20: kernel L1[%u] = 0x%lx -> 0",
+				     i, l1[i]);
+				l1[i] = 0;
+				break;
+			}
+		}
+		break;
+	}
+	case 21: { /* TA L1 entry write — bad value (not 0, not thread_l2_desc) */
+		/* TA L1 starts 32 bytes after kernel L1 in the same page,
+		 * so it begins at slot index 4 in the combined view. */
+		DMSG("attack 21: TA L1[4] = 0x%lx -> 0xdeadbeef00000003",
+		     l1[4]);
+		l1[4] = 0xdeadbeef00000003ULL;
+		break;
+	}
+	case 22: { /* Kernel L2 entry write — walk via a known kernel VA */
+		l2 = attack_get_l2((vaddr_t)attack_rw_page);
+		DMSG("attack 22: kernel L2[0] = 0x%lx -> 0xdeadbeef",
+		     l2[0]);
+		l2[0] = 0xdeadbeef;
+		break;
+	}
+	case 23: { /* Per-thread L2 block descriptor in an empty slot */
+		if (!target_va) {
+			EMSG("attack 23 requires TA user VA in target_va");
+			return;
+		}
+		l2 = attack_get_l2(target_va);
+		slot = attack_find_empty_l2_slot(l2);
+		if (slot < 0) {
+			EMSG("attack 23: no empty L2 slot");
+			return;
+		}
+		/* 2MB block descriptor pointing at a fake PA — type=0b01. */
+		DMSG("attack 23: thread L2[%d] = 0 -> 0x12345001 (block)",
+		     slot);
+		l2[slot] = 0x12345000ULL | BLOCK_DESC;
+		break;
+	}
+	case 24: { /* Per-thread L2 table descriptor with NSTable bit set */
+		if (!target_va) {
+			EMSG("attack 24 requires TA user VA in target_va");
+			return;
+		}
+		l2 = attack_get_l2(target_va);
+		slot = attack_find_empty_l2_slot(l2);
+		if (slot < 0) {
+			EMSG("attack 24: no empty L2 slot");
+			return;
+		}
+		/* NSTable is bit 63 on an L1/L2 table descriptor. */
+		DMSG("attack 24: thread L2[%d] = 0 -> NSTable + table",
+		     slot);
+		l2[slot] = 0x12345000ULL | TABLE_DESC | (1ULL << 63);
+		break;
+	}
+	case 25: { /* 25a: link a fresh L3 pre-loaded with one W^X PTE */
+		if (!target_va) {
+			EMSG("attack 25a requires TA user VA in target_va");
+			return;
+		}
+		memset(attack_fake_l3, 0, sizeof(attack_fake_l3));
+		/* Malicious PTE: PA=attack_rw_page, writable+EL0-executable.
+		 *   bits 0..11 = 0xf4f  (page desc, AttrIndx=3, AP_EL0=1,
+		 *                       AP_RO=0, SH=ISH, AF=1, nG=1)
+		 *   bits 52..55 = 0x2   (PXN=1, UXN=0)  → W∧X. */
+		pa = virt_to_phys(attack_rw_page);
+		attack_fake_l3[0] = pa | 0x20000000000f4fULL;
+
+		uint64_t fake_l3_pa = virt_to_phys(attack_fake_l3);
+
+		l2 = attack_get_l2(target_va);
+		slot = attack_find_empty_l2_slot(l2);
+		if (slot < 0) {
+			EMSG("attack 25a: no empty L2 slot");
+			return;
+		}
+		DMSG("attack 25a: link fake L3 PA=0x%lx (PTE[0]=0x%lx) at "
+		     "thread L2[%d]", fake_l3_pa, attack_fake_l3[0], slot);
+		l2[slot] = fake_l3_pa | TABLE_DESC;
+		break;
+	}
+	case 26: { /* 25b: link a kernel L3 PA into the per-thread L2 */
+		if (!target_va) {
+			EMSG("attack 25b requires TA user VA in target_va");
+			return;
+		}
+		/* Harvest a kernel L3 PA by walking to the kernel L2 and
+		 * picking any TABLE_DESC entry. */
+		uint64_t *kernel_l2 =
+			attack_get_l2((vaddr_t)attack_rw_page);
+		uint64_t kernel_l3_pa = 0;
+
+		for (uint32_t i = 0; i < 512; i++) {
+			if ((kernel_l2[i] & 0x3) == TABLE_DESC) {
+				kernel_l3_pa = kernel_l2[i] & ATTACK_PA_MASK;
+				break;
+			}
+		}
+		if (!kernel_l3_pa) {
+			EMSG("attack 25b: no kernel L3 PA found");
+			return;
+		}
+		l2 = attack_get_l2(target_va);
+		slot = attack_find_empty_l2_slot(l2);
+		if (slot < 0) {
+			EMSG("attack 25b: no empty L2 slot");
+			return;
+		}
+		DMSG("attack 25b: link kernel L3 PA=0x%lx at thread L2[%d]",
+		     kernel_l3_pa, slot);
+		l2[slot] = kernel_l3_pa | TABLE_DESC;
+		break;
+	}
+	case 27: { /* 25c: alias an existing thread L3 PA into a 2nd L2 slot */
+		if (!target_va) {
+			EMSG("attack 25c requires TA user VA in target_va");
+			return;
+		}
+		l2 = attack_get_l2(target_va);
+		uint64_t existing_l3_pa = 0;
+		int32_t source_slot = -1;
+
+		for (uint32_t i = 0; i < 512; i++) {
+			if ((l2[i] & 0x3) == TABLE_DESC) {
+				existing_l3_pa = l2[i] & ATTACK_PA_MASK;
+				source_slot = i;
+				break;
+			}
+		}
+		if (!existing_l3_pa) {
+			EMSG("attack 25c: no existing thread L3 PA");
+			return;
+		}
+		slot = attack_find_empty_l2_slot(l2);
+		if (slot < 0 || slot == source_slot) {
+			EMSG("attack 25c: no different empty L2 slot");
+			return;
+		}
+		DMSG("attack 25c: alias thread L3 PA=0x%lx into L2[%d] "
+		     "(also linked from L2[%d])",
+		     existing_l3_pa, slot, source_slot);
+		l2[slot] = existing_l3_pa | TABLE_DESC;
+		break;
+	}
+	default:
+		EMSG("pgtable_attack_structure: unknown type %lu", attack_type);
+		return;
+	}
+
+	dsb();
+	tlbi_all();
+	isb();
+}
+
 void pgtable_attack(unsigned long attack_type, unsigned long target_va)
 {
 	vaddr_t target;
 	uint64_t *pte;
 	uint64_t v;
+
+	if (attack_type >= 20) {
+		pgtable_attack_structure(attack_type, target_va);
+		return;
+	}
 
 	if (target_va) {
 		/* A caller-supplied target VA drives the write into a per-thread
