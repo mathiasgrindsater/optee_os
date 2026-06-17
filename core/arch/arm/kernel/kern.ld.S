@@ -271,6 +271,16 @@ SECTIONS
 		. = ALIGN(16);
 		__nozi_end = .;
 		/*
+		 * VMI defense addition: align thread stacks to a fresh page
+		 * boundary. base_xlation_table (in .nozi.mmu.base_table)
+		 * lands at the end of the .nozi group and only occupies 64
+		 * bytes; without this alignment, stack_thread starts in the
+		 * same 4 KiB physical page as the L1 base tables, and every
+		 * stack push triggers a stage-2 fault under the L1 S2-RO
+		 * protection.
+		 */
+		. = ALIGN(SMALL_PAGE_SIZE);
+		/*
 		 * If virtualization is enabled, abt and tmp stacks will placed
 		 * at above .nex_stack section and thread stacks will go there
 		 */

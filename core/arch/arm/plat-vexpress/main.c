@@ -90,7 +90,23 @@ unsigned long plat_get_aslr_seed(void)
 	uint64_t cntpct;
 
 	asm volatile("mrs %0, cntpct_el0" : "=r" (cntpct));
-	return cntpct;
+	/*
+	 * VMI thesis: amplify counter variation into the high bits of the
+	 * seed so ASLR can place the kernel in any L1 entry. FVP cntpct
+	 * is deterministic across boots, so swap between variants below
+	 * to exercise different L1 layouts.
+	 *
+	 *   return cntpct;                       // V1: small, L1[0]
+	 *   return cntpct << 8;                  // V2: medium
+	 *   return cntpct << 14;                 // V3: larger
+	 *   return cntpct << 18;                 // V4: kernel L1[0]+L1[3]
+	 *   return (cntpct << 8) ^ 0x80000000;   // V5: bias L1[2]
+	 *   return (cntpct << 8) ^ 0xC0000000;   // V6: bias L1[3]
+	 *   return (cntpct << 8) ^ 0x40000000;   // V7: bias L1[1]
+	 *   return 0x78E00000;                   // V8: 3-entry, spans L1[1]+L1[2]
+	 *   return 0xB8E00000;                   // V9: 3-entry, spans L1[2]+L1[3]
+	 */
+	return 0x78E00000;
 }
 
 void plat_console_init(void)
