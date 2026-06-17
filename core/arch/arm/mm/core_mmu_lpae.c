@@ -215,7 +215,11 @@
 #	define XLAT_TABLE_TEE_EXTRA 8
 #	define XLAT_TABLE_USER_EXTRA (NUM_BASE_TABLES * CFG_TEE_CORE_NB_CORE)
 #else
-#	define XLAT_TABLE_TEE_EXTRA 5
+/* VMI thesis: bumped from 5 → 8 so that 3-entry ASLR layouts (kernel
+ * mapping spanning two L1 slots + L1[0] identity = 3 L2s + ~5 L3s)
+ * fit in the static pool. Upstream OP-TEE's default 5 is too tight
+ * when ASLR pushes the kernel across a 1 GiB boundary. */
+#	define XLAT_TABLE_TEE_EXTRA 8
 #	define XLAT_TABLE_USER_EXTRA 0
 #endif
 #define MAX_XLAT_TABLES		(XLAT_TABLE_TEE_EXTRA + \
