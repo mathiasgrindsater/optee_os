@@ -275,18 +275,18 @@ typedef uint16_t l1_idx_t;
 #define BASE_TABLE_SIZE		(NUM_BASE_LEVEL_ENTRIES * NUM_BASE_TABLES * \
 				 XLAT_ENTRY_SIZE)
 #ifndef CFG_DYN_CONFIG
-static uint64_t base_xlation_table[BASE_TABLE_SIZE * CFG_TEE_CORE_NB_CORE /
-				   XLAT_ENTRY_SIZE]
+uint64_t base_xlation_table[BASE_TABLE_SIZE * CFG_TEE_CORE_NB_CORE /
+			    XLAT_ENTRY_SIZE]
 	__aligned(NUM_BASE_LEVEL_ENTRIES * XLAT_ENTRY_SIZE)
 	__section(".nozi.mmu.base_table");
 
-static uint64_t xlat_tables[XLAT_TABLE_SIZE * MAX_XLAT_TABLES /
-			    XLAT_ENTRY_SIZE]
+uint64_t xlat_tables[XLAT_TABLE_SIZE * MAX_XLAT_TABLES /
+		     XLAT_ENTRY_SIZE]
 	__aligned(XLAT_TABLE_SIZE) __section(".nozi.mmu.l2");
 
 /* MMU L2 table for TAs, one for each thread */
-static uint64_t xlat_tables_ul1[XLAT_TABLE_SIZE * CFG_NUM_THREADS /
-				XLAT_ENTRY_SIZE]
+uint64_t xlat_tables_ul1[XLAT_TABLE_SIZE * CFG_NUM_THREADS /
+			 XLAT_ENTRY_SIZE]
 	__aligned(XLAT_TABLE_SIZE) __section(".nozi.mmu.l2");
 
 #if (CORE_MMU_BASE_TABLE_LEVEL == 0)
